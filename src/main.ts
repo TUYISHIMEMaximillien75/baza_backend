@@ -44,7 +44,7 @@ async function bootstrap() {
   });
 
   // Global prefix & URI versioning (/api/v1/...)
-  app.setGlobalPrefix('api');
+  app.setGlobalPrefix('api', { exclude: ['/'] });
   app.enableVersioning({
     type: VersioningType.URI,
     defaultVersion: '1',

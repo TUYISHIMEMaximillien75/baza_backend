@@ -39,6 +39,8 @@ import {
   VisitRequest,
 } from './database/entities';
 
+import { AppController } from './app.controller';
+
 @Module({
   imports: [
     ConfigModule.forRoot({
@@ -104,6 +106,7 @@ import {
     UploadsModule,
     AdminModule,
   ],
+  controllers: [AppController],
   providers: [
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
