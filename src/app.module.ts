@@ -23,6 +23,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { ReportsModule } from './modules/reports/reports.module';
 import { UploadsModule } from './modules/uploads/uploads.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { AiSearchModule } from './modules/ai-search/ai-search.module';
 import {
   Category,
   ContactRequest,
@@ -105,6 +106,7 @@ import { AppController } from './app.controller';
     ReportsModule,
     UploadsModule,
     AdminModule,
+    AiSearchModule,
   ],
   controllers: [AppController],
   providers: [
