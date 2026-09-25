@@ -37,9 +37,8 @@ async function bootstrap() {
   app.use(helmet());
 
   // CORS
-  const frontendUrl = configService.get<string>('frontendUrl', 'http://localhost:5173');
   app.enableCors({
-    origin: [frontendUrl, 'http://localhost:5173', 'http://localhost:3000'],
+    origin: (origin, callback) => callback(null, true),
     credentials: true,
   });
 
