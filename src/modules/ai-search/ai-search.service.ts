@@ -1,104 +1,172 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 import fetch from 'node-fetch';
 import { Listing } from '../listings/entities/listing.entity';
 import { ListingStatus } from '../../common/enums';
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 interface ParsedSearchParams {
-  search?: string;
+  categorySlug?: string;
+  categoryKeywords?: string[]; // synonyms the AI knows about
+  purpose?: 'SALE' | 'RENT';
   province?: string;
   district?: string;
   sector?: string;
-  purpose?: 'SALE' | 'RENT';
-  categorySlug?: string;
   minPrice?: number;
   maxPrice?: number;
   minRooms?: number;
-  keywords?: string[];
+  freeTextSearch?: string; // general keyword search in title+desc
   aiExplanation: string;
+  confidence: 'HIGH' | 'MEDIUM' | 'LOW';
 }
+
+// ─── Synonym maps (client-side pre-processing as safety net) ──────────────────
+const CATEGORY_SYNONYMS: Record<string, string> = {
+  car: 'vehicles', cars: 'vehicles', vehicle: 'vehicles', vehicles: 'vehicles',
+  truck: 'vehicles', bus: 'vehicles', motorbike: 'vehicles', motorcycle: 'vehicles',
+  toyota: 'vehicles', honda: 'vehicles', mazda: 'vehicles', bmw: 'vehicles',
+  mercedes: 'vehicles', nissan: 'vehicles', hyundai: 'vehicles', suzuki: 'vehicles',
+  suv: 'vehicles', sedan: 'vehicles', pickup: 'vehicles', 'pick-up': 'vehicles',
+  house: 'houses', houses: 'houses', home: 'houses', villa: 'houses',
+  bungalow: 'houses', building: 'houses', maison: 'houses', inzu: 'houses',
+  apartment: 'apartments', flat: 'apartments', studio: 'apartments',
+  'self-contained': 'apartments', bedsitter: 'apartments',
+  land: 'land-plots', plot: 'land-plots', terrain: 'land-plots',
+  plots: 'land-plots', 'land plot': 'land-plots', ubutaka: 'land-plots',
+  commercial: 'commercial', office: 'commercial', shop: 'commercial',
+  warehouse: 'commercial', boutique: 'commercial',
+};
+
+const PURPOSE_SYNONYMS: Record<string, 'SALE' | 'RENT'> = {
+  buy: 'SALE', purchase: 'SALE', sale: 'SALE', sell: 'SALE', 'for sale': 'SALE',
+  gutanga: 'SALE', kugura: 'SALE',
+  rent: 'RENT', lease: 'RENT', hire: 'RENT', 'for rent': 'RENT',
+  gukoranya: 'RENT', gukodesha: 'RENT',
+};
 
 @Injectable()
 export class AiSearchService {
   private readonly logger = new Logger(AiSearchService.name);
-  private readonly groqApiKey: string;
   private readonly groqApiUrl = 'https://api.groq.com/openai/v1/chat/completions';
 
   constructor(
     private readonly configService: ConfigService,
     @InjectRepository(Listing)
     private readonly listingsRepository: Repository<Listing>,
-  ) {
-    this.groqApiKey = this.configService.get<string>('groqApiKey') || process.env.GROQ_API_KEY || '';
-  }
+  ) {}
 
+  // ─── Public entry ─────────────────────────────────────────────────────────
   async search(userQuery: string) {
-    // Step 1: Parse the natural language query with Groq
-    const parsed = await this.parseQueryWithAI(userQuery);
+    const normalizedQuery = userQuery.trim();
 
-    // Step 2: Build and execute a DB query using the parsed params
-    const results = await this.searchListings(parsed);
+    // Pre-process: apply local synonym map before sending to AI
+    const preParams = this.localPreProcess(normalizedQuery);
+
+    // Parse with AI (merges with pre-processed params)
+    const parsed = await this.parseWithGroq(normalizedQuery, preParams);
+
+    // Search with fallback strategy
+    const { results, strategy } = await this.searchWithFallback(parsed, normalizedQuery);
 
     return {
-      query: userQuery,
+      query: normalizedQuery,
       aiExplanation: parsed.aiExplanation,
+      appliedStrategy: strategy,
       parsedFilters: {
-        search: parsed.search,
+        categorySlug: parsed.categorySlug,
+        purpose: parsed.purpose,
         province: parsed.province,
         district: parsed.district,
-        purpose: parsed.purpose,
-        categorySlug: parsed.categorySlug,
+        sector: parsed.sector,
         minPrice: parsed.minPrice,
         maxPrice: parsed.maxPrice,
+        minRooms: parsed.minRooms,
       },
       results,
+      totalFound: results.length,
     };
   }
 
-  private async parseQueryWithAI(query: string): Promise<ParsedSearchParams> {
-    const systemPrompt = `You are a smart search assistant for BAZA Marketplace — Rwanda's premier property and vehicle listing platform.
+  // ─── Local pre-processor (no AI needed for obvious cases) ─────────────────
+  private localPreProcess(query: string): Partial<ParsedSearchParams> {
+    const q = query.toLowerCase();
+    const params: Partial<ParsedSearchParams> = {};
 
-Your job is to parse a user's natural language search query into structured search filters for a PostgreSQL database.
+    // Detect category from synonyms
+    for (const [word, slug] of Object.entries(CATEGORY_SYNONYMS)) {
+      if (q.includes(word)) {
+        params.categorySlug = slug;
+        break;
+      }
+    }
 
-Available filters you can extract:
-- search: general keyword string to search in listing title and description
-- province: Rwandan province name (e.g. "Kigali City", "Northern Province", "Southern Province", "Eastern Province", "Western Province")
-- district: district name (e.g. "Gasabo", "Kicukiro", "Nyarugenge", "Rubavu")
-- sector: sector name (e.g. "Kanombe", "Gacuriro", "Kimihurura", "Nyarutarama")
-- purpose: either "SALE" or "RENT"
-- categorySlug: one of: "houses", "land-plots", "vehicles", "apartments", "commercial"
-- minPrice: minimum price in RWF (integer)
-- maxPrice: maximum price in RWF (integer)
-- minRooms: minimum number of rooms/bedrooms mentioned
-- keywords: array of key terms to search in descriptions
+    // Detect purpose from synonyms
+    for (const [word, purpose] of Object.entries(PURPOSE_SYNONYMS)) {
+      if (q.includes(word)) {
+        params.purpose = purpose;
+        break;
+      }
+    }
 
-IMPORTANT RULES:
-- If the user says "Kanombe", it is a sector in Kigali City (Kicukiro district)
-- If the user says "Gacuriro", it is a sector in Gasabo district
-- If the user mentions rooms, extract the number for minRooms
-- If user says "buy" or "purchase" or "for sale", set purpose to "SALE"
-- If user says "rent" or "to rent" or "for rent", set purpose to "RENT"
-- If user says "house" or "building" or "home", set categorySlug to "houses"
-- If user says "apartment" or "flat", set categorySlug to "apartments"
-- If user says "land" or "plot" or "terrain", set categorySlug to "land-plots"
-- If user says "car" or "vehicle" or "truck", set categorySlug to "vehicles"
-- Generate a friendly one-sentence aiExplanation in English describing what you are searching for
+    // Detect room count: "3 rooms", "4 bedrooms", "5 chambres"
+    const roomMatch = q.match(/(\d+)\s*(?:room|bedroom|chambre|piece|pièce)/i);
+    if (roomMatch) params.minRooms = parseInt(roomMatch[1], 10);
 
-Always respond with valid JSON only. No extra text. Example format:
+    // Detect "more than N rooms" / "at least N rooms"
+    const moreRoomsMatch = q.match(/(?:more than|at least|above|greater than|plus de|au moins)\s*(\d+)\s*(?:room|bedroom)/i);
+    if (moreRoomsMatch) params.minRooms = parseInt(moreRoomsMatch[1], 10) + 1;
+
+    return params;
+  }
+
+  // ─── Groq AI parser ───────────────────────────────────────────────────────
+  private async parseWithGroq(query: string, preParams: Partial<ParsedSearchParams>): Promise<ParsedSearchParams> {
+    const groqApiKey = this.configService.get<string>('groqApiKey') || process.env.GROQ_API_KEY || '';
+
+    const systemPrompt = `You are an intelligent search assistant for BAZA Marketplace — Rwanda's property & vehicle marketplace.
+
+Parse the user's query into structured JSON filters. Use smart reasoning to understand intent.
+
+CATEGORY SLUGS (only use these exact values):
+- "vehicles" → any car, truck, motorcycle, SUV, pickup, Toyota, Honda, Mazda, BMW, Nissan, Kia, Hyundai, etc.
+- "houses" → house, home, villa, bungalow, building, mansion, inzu (Kinyarwanda for house)
+- "apartments" → apartment, flat, studio, bedsitter, self-contained
+- "land-plots" → land, plot, terrain, ubutaka (Kinyarwanda for land)
+- "commercial" → office, shop, warehouse, commercial space, boutique
+
+LOCATION (Rwanda):
+- Sectors: Kanombe, Gacuriro, Kimihurura, Nyarutarama, Kacyiru, Remera, Gisozi, Kibagabaga, Nyamirambo, Gitega, Rubavu, Musanze, Huye, Butare
+- Districts: Gasabo, Kicukiro, Nyarugenge, Rubavu, Gicumbi, Rwamagana, Huye, Musanze, Ngoma
+- Provinces: "Kigali City", "Northern Province", "Southern Province", "Eastern Province", "Western Province"
+
+RULES:
+1. "cars" = vehicles, "car" = vehicles, "Toyota" = vehicles
+2. "houses" = houses category, "home" = houses category
+3. "for rent" or "to rent" or "gukodesha" = purpose RENT
+4. "for sale" or "buy" or "purchase" = purpose SALE
+5. Extract room count if mentioned (e.g. "3 rooms", "more than 2 bedrooms", "at least 4 rooms")
+6. categoryKeywords = list of synonyms/words from the query that describe the type (helps text search)
+7. freeTextSearch = only use if user mentions very specific things like brand/model (e.g. "Toyota RAV4 2020")
+8. confidence = HIGH if you are sure, MEDIUM if partially sure, LOW if guessing
+9. aiExplanation = friendly one sentence describing what you found
+
+Respond ONLY with valid JSON:
 {
-  "search": "house rooms",
-  "province": "Kigali City",
-  "district": "Kicukiro",
-  "sector": "Kanombe",
-  "purpose": null,
-  "categorySlug": "houses",
+  "categorySlug": "vehicles" | "houses" | "apartments" | "land-plots" | "commercial" | null,
+  "categoryKeywords": ["car", "vehicle", "auto"],
+  "purpose": "SALE" | "RENT" | null,
+  "province": null,
+  "district": null,
+  "sector": null,
   "minPrice": null,
   "maxPrice": null,
-  "minRooms": 3,
-  "keywords": ["rooms", "house"],
-  "aiExplanation": "Showing houses in Kanombe with at least 3 rooms."
+  "minRooms": null,
+  "freeTextSearch": null,
+  "confidence": "HIGH" | "MEDIUM" | "LOW",
+  "aiExplanation": "Showing vehicles for sale in Kanombe under 15M RWF."
 }`;
 
     try {
@@ -106,103 +174,118 @@ Always respond with valid JSON only. No extra text. Example format:
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.groqApiKey}`,
+          Authorization: `Bearer ${groqApiKey}`,
         },
         body: JSON.stringify({
           model: 'llama-3.1-8b-instant',
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Parse this search query: "${query}"` },
+            { role: 'user', content: `Parse this search: "${query}"` },
           ],
-          temperature: 0.1,
-          max_tokens: 400,
+          temperature: 0.05,
+          max_tokens: 350,
           response_format: { type: 'json_object' },
         }),
       });
 
       if (!response.ok) {
-        const err = await response.text();
-        this.logger.error(`Groq API error: ${err}`);
-        return this.fallbackParse(query);
+        this.logger.warn(`Groq error ${response.status} — using pre-processed params`);
+        return this.buildFromPreParams(query, preParams);
       }
 
       const data: any = await response.json();
       const content = data?.choices?.[0]?.message?.content;
-      if (!content) return this.fallbackParse(query);
+      if (!content) return this.buildFromPreParams(query, preParams);
 
-      const parsed = JSON.parse(content);
+      const ai = JSON.parse(content);
+
+      // Merge AI result with pre-processed params (pre-params win for safety)
       return {
-        search: parsed.search || query,
-        province: parsed.province || undefined,
-        district: parsed.district || undefined,
-        sector: parsed.sector || undefined,
-        purpose: parsed.purpose || undefined,
-        categorySlug: parsed.categorySlug || undefined,
-        minPrice: parsed.minPrice ? Number(parsed.minPrice) : undefined,
-        maxPrice: parsed.maxPrice ? Number(parsed.maxPrice) : undefined,
-        minRooms: parsed.minRooms ? Number(parsed.minRooms) : undefined,
-        keywords: parsed.keywords || [],
-        aiExplanation: parsed.aiExplanation || `Showing results for: "${query}"`,
+        categorySlug: preParams.categorySlug || ai.categorySlug || undefined,
+        categoryKeywords: ai.categoryKeywords || [],
+        purpose: preParams.purpose || ai.purpose || undefined,
+        province: ai.province || undefined,
+        district: ai.district || undefined,
+        sector: ai.sector || undefined,
+        minPrice: ai.minPrice ? Number(ai.minPrice) : undefined,
+        maxPrice: ai.maxPrice ? Number(ai.maxPrice) : undefined,
+        minRooms: preParams.minRooms || (ai.minRooms ? Number(ai.minRooms) : undefined),
+        freeTextSearch: ai.freeTextSearch || undefined,
+        aiExplanation: ai.aiExplanation || `Showing results for "${query}"`,
+        confidence: ai.confidence || 'MEDIUM',
       };
-    } catch (error) {
-      this.logger.error('Failed to parse query with AI', error);
-      return this.fallbackParse(query);
+    } catch (err) {
+      this.logger.error('Groq parse failed', err);
+      return this.buildFromPreParams(query, preParams);
     }
   }
 
-  private fallbackParse(query: string): ParsedSearchParams {
+  private buildFromPreParams(query: string, pre: Partial<ParsedSearchParams>): ParsedSearchParams {
     return {
-      search: query,
-      aiExplanation: `Showing results for: "${query}"`,
+      ...pre,
+      freeTextSearch: query,
+      aiExplanation: `Showing results for "${query}"`,
+      confidence: 'LOW',
     };
   }
 
-  private async searchListings(params: ParsedSearchParams) {
-    const qb = this.listingsRepository
-      .createQueryBuilder('listing')
-      .leftJoinAndSelect('listing.owner', 'owner')
-      .leftJoinAndSelect('listing.category', 'category')
-      .leftJoinAndSelect('listing.location', 'location')
-      .where('listing.status = :status', { status: ListingStatus.PUBLISHED });
+  // ─── Fallback search strategy ─────────────────────────────────────────────
+  private async searchWithFallback(params: ParsedSearchParams, rawQuery: string) {
+    // Strategy 1: Full filters
+    let results = await this.executeSearch(params, 'FULL');
+    if (results.length > 0) return { results, strategy: 'full_filters' };
 
-    // Build keyword search from title, description, and extracted keywords
-    if (params.search) {
-      const searchTerms = [params.search, ...(params.keywords || [])].filter(Boolean);
-      const searchConditions = searchTerms.map((_, i) => 
-        `(LOWER(listing.title) LIKE :term${i} OR LOWER(listing.description) LIKE :term${i})`
-      );
-      const searchParams: Record<string, string> = {};
-      searchTerms.forEach((term, i) => {
-        searchParams[`term${i}`] = `%${term.toLowerCase()}%`;
-      });
-      if (searchConditions.length > 0) {
-        qb.andWhere(`(${searchConditions.join(' OR ')})`, searchParams);
-      }
+    // Strategy 2: Drop freeText, keep structured filters only
+    if (params.freeTextSearch) {
+      results = await this.executeSearch({ ...params, freeTextSearch: undefined }, 'STRUCTURED_ONLY');
+      if (results.length > 0) return { results, strategy: 'structured_filters' };
     }
 
-    // Location filters
+    // Strategy 3: Category + Location only (drop price, rooms, purpose)
+    if (params.categorySlug || params.sector || params.district) {
+      results = await this.executeSearch({
+        categorySlug: params.categorySlug,
+        sector: params.sector,
+        district: params.district,
+        province: params.province,
+        aiExplanation: params.aiExplanation,
+        confidence: 'LOW',
+      }, 'BROAD');
+      if (results.length > 0) return { results, strategy: 'broad_category_location' };
+    }
+
+    // Strategy 4: Category keywords text search
+    if (params.categoryKeywords && params.categoryKeywords.length > 0) {
+      results = await this.executeKeywordSearch(params.categoryKeywords);
+      if (results.length > 0) return { results, strategy: 'keyword_fallback' };
+    }
+
+    // Strategy 5: Raw query text search — last resort
+    results = await this.executeKeywordSearch([rawQuery]);
+    return { results, strategy: 'raw_text_fallback' };
+  }
+
+  // ─── Main search executor ─────────────────────────────────────────────────
+  private async executeSearch(params: Partial<ParsedSearchParams>, _mode: string) {
+    const qb = this.buildBase();
+
+    // Category filter (most important — use category join, not text)
+    if (params.categorySlug) {
+      qb.andWhere('category.slug = :catSlug', { catSlug: params.categorySlug });
+    }
+
+    // Location filters (sector > district > province)
     if (params.sector) {
-      qb.andWhere('LOWER(location.sector) LIKE :sector', {
-        sector: `%${params.sector.toLowerCase()}%`,
-      });
+      qb.andWhere('LOWER(location.sector) LIKE :sector', { sector: `%${params.sector.toLowerCase()}%` });
     } else if (params.district) {
-      qb.andWhere('LOWER(location.district) LIKE :district', {
-        district: `%${params.district.toLowerCase()}%`,
-      });
+      qb.andWhere('LOWER(location.district) LIKE :district', { district: `%${params.district.toLowerCase()}%` });
     } else if (params.province) {
-      qb.andWhere('LOWER(location.province) LIKE :province', {
-        province: `%${params.province.toLowerCase()}%`,
-      });
+      qb.andWhere('LOWER(location.province) LIKE :province', { province: `%${params.province.toLowerCase()}%` });
     }
 
     // Purpose
     if (params.purpose) {
       qb.andWhere('listing.purpose = :purpose', { purpose: params.purpose });
-    }
-
-    // Category
-    if (params.categorySlug) {
-      qb.andWhere('category.slug = :categorySlug', { categorySlug: params.categorySlug });
     }
 
     // Price range
@@ -213,39 +296,94 @@ Always respond with valid JSON only. No extra text. Example format:
       qb.andWhere('listing.price <= :maxPrice', { maxPrice: params.maxPrice });
     }
 
-    // Room count — search in description for number of rooms
+    // Rooms: search for any number >= minRooms in description
     if (params.minRooms !== undefined) {
+      const roomPatterns: string[] = [];
+      const roomParams: Record<string, string> = {};
+      // Match any room count >= minRooms up to 20
+      for (let r = params.minRooms; r <= 20; r++) {
+        const key = `room${r}`;
+        roomPatterns.push(
+          `LOWER(listing.description) LIKE :${key}a OR LOWER(listing.title) LIKE :${key}b OR LOWER(listing.description) LIKE :${key}c`,
+        );
+        roomParams[`${key}a`] = `%${r} room%`;
+        roomParams[`${key}b`] = `%${r} room%`;
+        roomParams[`${key}c`] = `%${r} bedroom%`;
+      }
+      qb.andWhere(`(${roomPatterns.join(' OR ')})`, roomParams);
+    }
+
+    // Free text search (only if provided)
+    if (params.freeTextSearch) {
+      const t = params.freeTextSearch.toLowerCase();
       qb.andWhere(
-        `(LOWER(listing.description) LIKE :roomKw OR LOWER(listing.title) LIKE :roomKw)`,
-        { roomKw: `%${params.minRooms} room%` }
+        '(LOWER(listing.title) LIKE :ft OR LOWER(listing.description) LIKE :ft)',
+        { ft: `%${t}%` },
       );
     }
 
-    qb.orderBy('listing.isFeatured', 'DESC').addOrderBy('listing.publishedAt', 'DESC').take(20);
+    return this.runAndMap(qb);
+  }
 
+  // Keyword search across title + description using OR on multiple terms
+  private async executeKeywordSearch(terms: string[]) {
+    const qb = this.buildBase();
+    const conditions: string[] = [];
+    const params: Record<string, string> = {};
+
+    terms.forEach((term, i) => {
+      const words = term.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+      words.forEach((word, j) => {
+        const key = `kw_${i}_${j}`;
+        conditions.push(`LOWER(listing.title) LIKE :${key} OR LOWER(listing.description) LIKE :${key}`);
+        params[key] = `%${word}%`;
+      });
+    });
+
+    if (conditions.length === 0) return [];
+    qb.andWhere(`(${conditions.join(' OR ')})`, params);
+    return this.runAndMap(qb);
+  }
+
+  // ─── Shared builder ───────────────────────────────────────────────────────
+  private buildBase(): SelectQueryBuilder<Listing> {
+    return this.listingsRepository
+      .createQueryBuilder('listing')
+      .leftJoinAndSelect('listing.owner', 'owner')
+      .leftJoinAndSelect('listing.category', 'category')
+      .leftJoinAndSelect('listing.location', 'location')
+      .where('listing.status = :status', { status: ListingStatus.PUBLISHED })
+      .orderBy('listing.isFeatured', 'DESC')
+      .addOrderBy('listing.isVerified', 'DESC')
+      .addOrderBy('listing.publishedAt', 'DESC')
+      .take(20);
+  }
+
+  private async runAndMap(qb: SelectQueryBuilder<Listing>) {
     const listings = await qb.getMany();
-
-    return listings.map((listing) => {
-      const locationStr = listing.location
-        ? [listing.location.sector, listing.location.district, listing.location.province]
-            .filter(Boolean)
-            .join(', ')
-        : '';
+    return listings.map((l) => {
+      const locationParts = l.location
+        ? [l.location.sector, l.location.district, l.location.province].filter(Boolean)
+        : [];
       return {
-        id: listing.id,
-        title: listing.title,
-        slug: listing.slug,
-        description: listing.description?.substring(0, 200),
-        price: Number(listing.price),
-        currency: listing.currency,
-        purpose: listing.purpose,
-        category: listing.category?.name ?? '',
-        categorySlug: listing.category?.slug ?? '',
-        location: locationStr,
-        coverImageUrl: listing.coverImageUrl ?? '',
-        isFeatured: listing.isFeatured,
-        isVerified: listing.isVerified,
-        createdAt: listing.createdAt?.toISOString() ?? '',
+        id: l.id,
+        title: l.title,
+        slug: l.slug,
+        description: l.description?.substring(0, 150) || '',
+        price: Number(l.price),
+        currency: l.currency,
+        purpose: l.purpose,
+        status: l.status,
+        category: l.category?.name ?? '',
+        categorySlug: l.category?.slug ?? '',
+        location: locationParts.join(', '),
+        locationShort: locationParts[0] || locationParts[1] || '',
+        coverImageUrl: l.coverImageUrl ?? '',
+        isFeatured: l.isFeatured,
+        isVerified: l.isVerified,
+        ownerName: l.owner ? `${l.owner.firstName} ${l.owner.lastName}` : '',
+        createdAt: l.createdAt?.toISOString() ?? '',
+        publishedAt: l.publishedAt?.toISOString() ?? null,
       };
     });
   }
