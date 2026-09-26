@@ -2,6 +2,7 @@ import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/commo
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder } from 'typeorm';
 import { Listing } from './entities/listing.entity';
+import { ListingImage } from './entities/listing-image.entity';
 import { ListingQueryDto } from './dto/listing-query.dto';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { Category } from '../categories/entities/category.entity';
@@ -13,6 +14,8 @@ export class ListingsService {
   constructor(
     @InjectRepository(Listing)
     private readonly listingsRepository: Repository<Listing>,
+    @InjectRepository(ListingImage)
+    private readonly listingImagesRepository: Repository<ListingImage>,
     @InjectRepository(Category)
     private readonly categoriesRepository: Repository<Category>,
     @InjectRepository(Location)
@@ -57,6 +60,9 @@ export class ListingsService {
       locationId = location.id;
     }
 
+    const allImageUrls = dto.imageUrls && dto.imageUrls.length > 0 ? dto.imageUrls : [];
+    const coverImageUrl = dto.coverImageUrl || allImageUrls[0] || 'https://images.unsplash.com/photo-1560518883-ce09059eeffa?auto=format&fit=crop&w=800&q=80';
+
     const listing = this.listingsRepository.create({
       title: dto.title,
       slug,
@@ -69,12 +75,26 @@ export class ListingsService {
       ownerId,
       categoryId: category.id,
       locationId: locationId || undefined,
-      coverImageUrl: dto.coverImageUrl || 'https://images.unsplash.com/photo-1560518883-ce09059eeffa?auto=format&fit=crop&w=800&q=80',
+      coverImageUrl,
       isVerified: true,
       isFeatured: false,
     });
 
     const saved = await this.listingsRepository.save(listing);
+
+    // Save listing images if provided
+    if (allImageUrls.length > 0) {
+      const imageEntities = allImageUrls.map((url, idx) =>
+        this.listingImagesRepository.create({
+          listingId: saved.id,
+          imageUrl: url,
+          isCover: url === coverImageUrl || idx === 0,
+          displayOrder: idx,
+        }),
+      );
+      await this.listingImagesRepository.save(imageEntities);
+    }
+
     return this.findBySlug(saved.slug);
   }
 
