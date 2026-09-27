@@ -26,6 +26,21 @@ import { LoggingInterceptor } from '../src/common/interceptors/logging.intercept
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 
 const server = express();
+
+// Global Express CORS handling for Vercel Serverless environment
+server.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Api-Version');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
 let cachedApp: any;
 
 async function bootstrap() {

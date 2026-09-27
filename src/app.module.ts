@@ -58,37 +58,45 @@ import { AppController } from './app.controller';
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        type: 'postgres',
-        host: configService.get<string>('database.host'),
-        port: configService.get<number>('database.port'),
-        username: configService.get<string>('database.username'),
-        password: configService.get<string>('database.password'),
-        database: configService.get<string>('database.name'),
-        ssl: configService.get<boolean>('database.ssl') ? { rejectUnauthorized: false } : false,
-        extra: {
-          family: 4, // Force IPv4 — required for Neon connectivity in this environment
-        },
-        entities: [
-          User,
-          Role,
-          UserProfile,
-          VerificationRequest,
-          Category,
-          Location,
-          Listing,
-          ListingImage,
-          SavedListing,
-          ContactRequest,
-          VisitRequest,
-          Notification,
-          Report,
-        ],
-        synchronize: false,
-        retryAttempts: 1,
-        retryDelay: 1000,
-        logging: configService.get<string>('nodeEnv') === 'development',
-      }),
+      useFactory: (configService: ConfigService) => {
+        const url = configService.get<string>('database.url');
+        const isSsl = configService.get<boolean>('database.ssl');
+        return {
+          type: 'postgres',
+          ...(url
+            ? { url }
+            : {
+                host: configService.get<string>('database.host'),
+                port: configService.get<number>('database.port'),
+                username: configService.get<string>('database.username'),
+                password: configService.get<string>('database.password'),
+                database: configService.get<string>('database.name'),
+              }),
+          ssl: isSsl ? { rejectUnauthorized: false } : false,
+          extra: {
+            family: 4, // Force IPv4 — required for Neon connectivity in this environment
+          },
+          entities: [
+            User,
+            Role,
+            UserProfile,
+            VerificationRequest,
+            Category,
+            Location,
+            Listing,
+            ListingImage,
+            SavedListing,
+            ContactRequest,
+            VisitRequest,
+            Notification,
+            Report,
+          ],
+          synchronize: false,
+          retryAttempts: 2,
+          retryDelay: 1000,
+          logging: false,
+        };
+      },
     }),
     HealthModule,
     AuthModule,

@@ -4,12 +4,13 @@ export default () => ({
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
   groqApiKey: process.env.GROQ_API_KEY || '',
   database: {
+    url: process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || '',
     host: process.env.DATABASE_HOST,
     port: parseInt(process.env.DATABASE_PORT || '5432', 10),
     username: process.env.DATABASE_USERNAME,
     password: process.env.DATABASE_PASSWORD,
     name: process.env.DATABASE_NAME,
-    ssl: process.env.DATABASE_SSL === 'true',
+    ssl: process.env.DATABASE_SSL === 'true' || !!(process.env.DATABASE_URL || process.env.NEON_DATABASE_URL),
   },
   jwt: {
     accessSecret: process.env.JWT_ACCESS_SECRET || 'dev_access_secret',
