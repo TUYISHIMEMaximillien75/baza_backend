@@ -21,20 +21,32 @@ class EnvironmentVariables {
   FRONTEND_URL: string;
 
   @IsString()
-  DATABASE_HOST: string;
+  @IsOptional()
+  DATABASE_URL?: string;
+
+  @IsString()
+  @IsOptional()
+  NEON_DATABASE_URL?: string;
+
+  @IsString()
+  @IsOptional()
+  DATABASE_HOST?: string;
 
   @IsNumber()
   @IsOptional()
-  DATABASE_PORT: number = 5432;
+  DATABASE_PORT?: number = 5432;
 
   @IsString()
-  DATABASE_USERNAME: string;
+  @IsOptional()
+  DATABASE_USERNAME?: string;
 
   @IsString()
-  DATABASE_PASSWORD: string;
+  @IsOptional()
+  DATABASE_PASSWORD?: string;
 
   @IsString()
-  DATABASE_NAME: string;
+  @IsOptional()
+  DATABASE_NAME?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>) {
