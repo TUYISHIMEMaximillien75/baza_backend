@@ -73,9 +73,7 @@ import { AppController } from './app.controller';
                 database: configService.get<string>('database.name'),
               }),
           ssl: isSsl ? { rejectUnauthorized: false } : false,
-          extra: {
-            family: 4, // Force IPv4 — required for Neon connectivity in this environment
-          },
+          extra: process.env.VERCEL ? {} : { family: 4 },
           entities: [
             User,
             Role,
